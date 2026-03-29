@@ -5,11 +5,14 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <dbus/dbus.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/dpms.h>
+
+static atomic_int allowed_counter = 0;
 
 void *idle_thread(void *arg) {
     (void) arg;
@@ -99,10 +102,13 @@ void *logind_thread(void *arg) {
                 dbus_bool_t going_to_sleep = false;
                 dbus_message_iter_get_basic(&args, &going_to_sleep);
 
-                if (going_to_sleep) {
+                int allowed = atomic_load(&allowed_counter);
+                if (going_to_sleep && allowed) {
+                    atomic_store(&allowed_counter, 0);
                     fprintf(stderr, "logind-thread: system going to sleep → locking screen\n");
                     lock_screen(LOCK_COMMAND);
                     sleep(2);
+                    atomic_store(&allowed_counter, 1);
                 } else {
                     fprintf(stderr, "logind-thread: system woke up\n");
                 }
@@ -141,7 +147,14 @@ void *screensaver_thread(void *arg) {
 
             if (xss_ev->state == ScreenSaverOn) {
                 fprintf(stderr, "screensaver-thread: X screensaver activated → locking\n");
-                lock_screen(LOCK_COMMAND);
+
+                int allowed = atomic_load(&allowed_counter);
+                if (allowed) {
+                    atomic_store(&allowed_counter, 0);
+                    lock_screen(LOCK_COMMAND);
+                    sleep(2);
+                    atomic_store(&allowed_counter, 1);
+                }
             } else if (xss_ev->state == ScreenSaverOff) {
                 fprintf(stderr, "screensaver-thread: X screensaver deactivated\n");
             }
