@@ -7,7 +7,7 @@
 
 #define LOCK_COMMAND "slock"
 #define INHIBIT_FILE "/tmp/idle_inhibit"
-#define SUSPEND_COMMAND "systemctl suspend"
+#define SUSPEND_COMMAND "loginctl suspend"
 
 #define IDLE_MANAGER_INTERVAL 5
 
