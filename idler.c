@@ -26,6 +26,12 @@ void *logind_thread(void *arg) {
         return NULL;
     }
 
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "logind-thread: cannot open display\n");
+        return NULL;
+    }
+
     dbus_bus_add_match(conn,
         "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
         &err);
@@ -51,12 +57,8 @@ void *logind_thread(void *arg) {
                 dbus_message_iter_get_basic(&args, &going_to_sleep);
 
                 if (going_to_sleep) {
-                    if (!atomic_exchange(&is_locked, true)) {
-                        fprintf(stderr, "logind-thread: system going to sleep -> locking\n");
-                        lock_screen(LOCK_COMMAND);
-                    } else {
-                        fprintf(stderr, "logind-thread: Already locked, ignoring callback.\n");
-                    }
+                    XForceScreenSaver(dpy, ScreenSaverActive);
+                    XFlush(dpy);
                 } else {
                     fprintf(stderr, "logind-thread: system woke up\n");
                 }
@@ -66,6 +68,7 @@ void *logind_thread(void *arg) {
         dbus_message_unref(msg);
     }
 
+    XCloseDisplay(dpy);
     return NULL;
 }
 
