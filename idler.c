@@ -5,72 +5,11 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <stdatomic.h>
 #include <sys/types.h>
 #include <X11/Xlib.h>
 #include <dbus/dbus.h>
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/dpms.h>
-
-static atomic_bool is_locked = false;
-
-void *logind_thread(void *arg) {
-    (void) arg;
-    DBusError err;
-    dbus_error_init(&err);
-    DBusConnection *conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
-    if (!conn) {
-        fprintf(stderr, "logind-thread: failed to connect to system bus: %s\n",
-                err.message ? err.message : "(null)");
-        if (dbus_error_is_set(&err)) dbus_error_free(&err);
-        return NULL;
-    }
-
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) {
-        fprintf(stderr, "logind-thread: cannot open display\n");
-        return NULL;
-    }
-
-    dbus_bus_add_match(conn,
-        "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
-        &err);
-    dbus_connection_flush(conn);
-    if (dbus_error_is_set(&err)) {
-        fprintf(stderr, "logind-thread: dbus match error: %s\n", err.message);
-        dbus_error_free(&err);
-    }
-
-    for (;;) {
-        dbus_connection_read_write(conn, 1000);
-        DBusMessage *msg = dbus_connection_pop_message(conn);
-        if (!msg) continue;
-
-        if (dbus_message_is_signal(msg,
-                                   "org.freedesktop.login1.Manager",
-                                   "PrepareForSleep")) {
-            DBusMessageIter args;
-            dbus_message_iter_init(msg, &args);
-
-            if (dbus_message_iter_get_arg_type(&args) == DBUS_TYPE_BOOLEAN) {
-                dbus_bool_t going_to_sleep = false;
-                dbus_message_iter_get_basic(&args, &going_to_sleep);
-
-                if (going_to_sleep) {
-                    XForceScreenSaver(dpy, ScreenSaverActive);
-                    XFlush(dpy);
-                } else {
-                    fprintf(stderr, "logind-thread: system woke up\n");
-                }
-            }
-        }
-
-        dbus_message_unref(msg);
-    }
-
-    XCloseDisplay(dpy);
-    return NULL;
-}
 
 void *idle_thread(void *arg) {
     (void) arg;
@@ -85,6 +24,25 @@ void *idle_thread(void *arg) {
         fprintf(stderr, "idle-thread: no XScreenSaver extension\n");
         XCloseDisplay(dpy);
         return NULL;
+    }
+
+    DBusError dberr;
+    dbus_error_init(&dberr);
+    DBusConnection *conn = dbus_bus_get(DBUS_BUS_SYSTEM, &dberr);
+    if (!conn) {
+        fprintf(stderr, "idle-thread: failed to connect to system bus: %s\n",
+                dberr.message ? dberr.message : "(null)");
+        if (dbus_error_is_set(&dberr)) dbus_error_free(&dberr);
+        return NULL;
+    }
+
+    dbus_bus_add_match(conn,
+        "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
+        &dberr);
+    dbus_connection_flush(conn);
+    if (dbus_error_is_set(&dberr)) {
+        fprintf(stderr, "idle-thread: dbus match error: %s\n", dberr.message);
+        dbus_error_free(&dberr);
     }
 
     XScreenSaverInfo *info = XScreenSaverAllocInfo();
@@ -116,6 +74,31 @@ void *idle_thread(void *arg) {
             changed = false;
         }
 
+        dbus_connection_read_write(conn, 1000);
+        DBusMessage *msg = dbus_connection_pop_message(conn);
+        if (!msg) continue;
+
+        if (dbus_message_is_signal(msg,
+                                   "org.freedesktop.login1.Manager",
+                                   "PrepareForSleep")) {
+            DBusMessageIter args;
+            dbus_message_iter_init(msg, &args);
+
+            if (dbus_message_iter_get_arg_type(&args) == DBUS_TYPE_BOOLEAN) {
+                dbus_bool_t going_to_sleep = false;
+                dbus_message_iter_get_basic(&args, &going_to_sleep);
+
+                if (going_to_sleep) {
+                    XForceScreenSaver(dpy, ScreenSaverActive);
+                    XFlush(dpy);
+                } else {
+                    fprintf(stderr, "idle-thread: system woke up\n");
+                }
+            }
+        }
+
+        dbus_message_unref(msg);
+
         sleep(IDLE_MANAGER_INTERVAL);
     }
 
@@ -141,6 +124,7 @@ void *screensaver_thread(void *arg) {
 
     XScreenSaverSelectInput(dpy, DefaultRootWindow(dpy), ScreenSaverNotifyMask);
 
+    bool locked = false;
     XEvent e;
     for (;;) {
         XNextEvent(dpy, &e);
@@ -149,8 +133,8 @@ void *screensaver_thread(void *arg) {
             XScreenSaverNotifyEvent *xss_ev = (XScreenSaverNotifyEvent *)&e;
 
             if (xss_ev->state == ScreenSaverOn) {
-                // Try to acquire the lock. If it was false, we set it to true and proceed.
-                if (!atomic_exchange(&is_locked, true)) {
+                if (!locked) {
+                    locked = true;
                     fprintf(stderr, "screensaver-thread: X screensaver activated -> locking\n");
                     lock_screen(LOCK_COMMAND);
                 } else {
@@ -158,9 +142,7 @@ void *screensaver_thread(void *arg) {
                 }
             } else if (xss_ev->state == ScreenSaverOff) {
                 fprintf(stderr, "screensaver-thread: X screensaver deactivated\n");
-
-                // User unlocked the screen! Reset the flag so it can lock again next time.
-                atomic_store(&is_locked, false);
+                locked = false;
             }
         }
     }
