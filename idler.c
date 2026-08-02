@@ -5,11 +5,37 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <X11/Xlib.h>
 #include <dbus/dbus.h>
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/dpms.h>
+
+pthread_mutex_t lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool is_locked = false;
+
+void safe_lock_screen(const char *cmd) {
+    pthread_mutex_lock(&lock_mutex);
+    if (is_locked) {
+        pthread_mutex_unlock(&lock_mutex);
+        fprintf(stderr, "lock_screen: already locked, skipping\n");
+        return;
+    }
+    is_locked = true;
+    pthread_mutex_unlock(&lock_mutex);
+
+    fprintf(stderr, "lock_screen: spawning lock command: %s\n", cmd);
+
+    // Blocking execution of your locker (e.g. slock / i3lock)
+    run_cmd(cmd);
+
+    pthread_mutex_lock(&lock_mutex);
+    is_locked = false;
+    pthread_mutex_unlock(&lock_mutex);
+    fprintf(stderr, "lock_screen: screen unlocked\n");
+}
 
 void *idle_thread(void *arg) {
     (void) arg;
@@ -33,6 +59,7 @@ void *idle_thread(void *arg) {
         fprintf(stderr, "idle-thread: failed to connect to system bus: %s\n",
                 dberr.message ? dberr.message : "(null)");
         if (dbus_error_is_set(&dberr)) dbus_error_free(&dberr);
+        XCloseDisplay(dpy);
         return NULL;
     }
 
@@ -49,7 +76,7 @@ void *idle_thread(void *arg) {
     bool changed = false;
 
     XSetScreenSaver(dpy, SCREENSAVER_TIMEOUT, SCREENSAVER_TIMEOUT,
-            DefaultBlanking, DefaultExposures);
+                    DefaultBlanking, DefaultExposures);
     DPMSEnable(dpy);
     DPMSSetTimeouts(dpy, DPMS_TIMEOUT, DPMS_TIMEOUT, DPMS_TIMEOUT);
 
@@ -74,30 +101,29 @@ void *idle_thread(void *arg) {
             changed = false;
         }
 
-        dbus_connection_read_write(conn, 1000);
-        DBusMessage *msg = dbus_connection_pop_message(conn);
-        if (!msg) continue;
+        // Drain all pending D-Bus messages in queue
+        dbus_connection_read_write(conn, 0);
+        DBusMessage *msg;
+        while ((msg = dbus_connection_pop_message(conn)) != NULL) {
+            if (dbus_message_is_signal(msg,
+                                       "org.freedesktop.login1.Manager",
+                                       "PrepareForSleep")) {
+                DBusMessageIter args;
+                dbus_message_iter_init(msg, &args);
 
-        if (dbus_message_is_signal(msg,
-                                   "org.freedesktop.login1.Manager",
-                                   "PrepareForSleep")) {
-            DBusMessageIter args;
-            dbus_message_iter_init(msg, &args);
+                if (dbus_message_iter_get_arg_type(&args) == DBUS_TYPE_BOOLEAN) {
+                    dbus_bool_t going_to_sleep = false;
+                    dbus_message_iter_get_basic(&args, &going_to_sleep);
 
-            if (dbus_message_iter_get_arg_type(&args) == DBUS_TYPE_BOOLEAN) {
-                dbus_bool_t going_to_sleep = false;
-                dbus_message_iter_get_basic(&args, &going_to_sleep);
-
-                if (going_to_sleep) {
-                    XForceScreenSaver(dpy, ScreenSaverActive);
-                    XFlush(dpy);
-                } else {
-                    fprintf(stderr, "idle-thread: system woke up\n");
+                    if (going_to_sleep) {
+                        safe_lock_screen(LOCK_COMMAND);
+                    } else {
+                        fprintf(stderr, "idle-thread: system woke up\n");
+                    }
                 }
             }
+            dbus_message_unref(msg);
         }
-
-        dbus_message_unref(msg);
 
         sleep(IDLE_MANAGER_INTERVAL);
     }
@@ -124,7 +150,6 @@ void *screensaver_thread(void *arg) {
 
     XScreenSaverSelectInput(dpy, DefaultRootWindow(dpy), ScreenSaverNotifyMask);
 
-    bool locked = false;
     XEvent e;
     for (;;) {
         XNextEvent(dpy, &e);
@@ -133,16 +158,7 @@ void *screensaver_thread(void *arg) {
             XScreenSaverNotifyEvent *xss_ev = (XScreenSaverNotifyEvent *)&e;
 
             if (xss_ev->state == ScreenSaverOn) {
-                if (!locked) {
-                    locked = true;
-                    fprintf(stderr, "screensaver-thread: X screensaver activated -> locking\n");
-                    lock_screen(LOCK_COMMAND);
-                } else {
-                    fprintf(stderr, "screensaver-thread: Already locked, ignoring event.\n");
-                }
-            } else if (xss_ev->state == ScreenSaverOff) {
-                fprintf(stderr, "screensaver-thread: X screensaver deactivated\n");
-                locked = false;
+                safe_lock_screen(LOCK_COMMAND);
             }
         }
     }
